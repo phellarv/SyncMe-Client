@@ -1,0 +1,8 @@
+watchdog
+httpx
+pydantic
+pydantic-settings
+click
+pathspec
+pytest
+pytest-asyncio

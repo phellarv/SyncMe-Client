@@ -1,0 +1,14 @@
+[Unit]
+Description=SyncMe Client Daemon
+After=network.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/syncme-client run
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target
