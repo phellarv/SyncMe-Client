@@ -457,8 +457,8 @@ def restore(file_path: str, revision: int, directory: str):
         
     async def _restore(engine, path, rev):
         try:
-            local_file = engine.db.get_file(engine.workspace_id, path)
-            expected_revision = local_file["revision"] if local_file else None
+            local_file = engine.db.get_file(path)
+            expected_revision = local_file.get("server_revision") if local_file else None
             
             result = await engine.api.restore_history(path, rev, expected_revision=expected_revision)
             new_rev = result.get("revision") or result.get("new_revision")

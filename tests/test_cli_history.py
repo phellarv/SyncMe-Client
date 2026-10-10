@@ -54,11 +54,49 @@ def test_cli_restore(mock_engines, tmp_path):
     test_file = tmp_path / "test.txt"
     test_file.touch()
     
-    engine.db.get_file.return_value = {"revision": 5}
+    engine.db.get_file.return_value = {"server_revision": 5}
     engine.api.restore_history = AsyncMock(return_value={"new_revision": 3})
     
     runner = CliRunner()
     result = runner.invoke(cli, ["restore", str(test_file), "--revision", "1"])
     assert result.exit_code == 0
     assert "Successfully restored" in result.output
+    engine.db.get_file.assert_called_once_with("test.txt")
     engine.api.restore_history.assert_called_once_with("test.txt", 1, expected_revision=5)
+
+def test_cli_restore_with_real_local_db(mock_engines, tmp_path):
+    from client.db import LocalDB
+    d_conf, engine = mock_engines
+    
+    test_file = tmp_path / "test.txt"
+    test_file.touch()
+    
+    real_db = LocalDB(tmp_path / ".syncme" / "local_state.db")
+    try:
+        real_db.upsert_file("test.txt", "abc", 10, 1000.0, 5, False)
+        engine.db = real_db
+        engine.api.restore_history = AsyncMock(return_value={"new_revision": 3})
+        
+        runner = CliRunner()
+        result = runner.invoke(cli, ["restore", str(test_file), "--revision", "1"])
+        assert result.exit_code == 0
+        assert "Successfully restored" in result.output
+        engine.api.restore_history.assert_called_once_with("test.txt", 1, expected_revision=5)
+    finally:
+        real_db.conn.close()
+
+def test_cli_restore_file_not_in_db(mock_engines, tmp_path):
+    d_conf, engine = mock_engines
+    
+    test_file = tmp_path / "test.txt"
+    test_file.touch()
+    
+    engine.db.get_file.return_value = None
+    engine.api.restore_history = AsyncMock(return_value={"new_revision": 3})
+    
+    runner = CliRunner()
+    result = runner.invoke(cli, ["restore", str(test_file), "--revision", "1"])
+    assert result.exit_code == 0
+    assert "Successfully restored" in result.output
+    engine.db.get_file.assert_called_once_with("test.txt")
+    engine.api.restore_history.assert_called_once_with("test.txt", 1, expected_revision=None)
