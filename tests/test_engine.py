@@ -85,6 +85,35 @@ async def test_reconcile_ignore_remote_file(sync_engine, tmp_path):
     assert sync_engine.db.get_file("ignored.txt") is None
 
 @pytest.mark.asyncio
+async def test_reconcile_exceptions_remote_and_local(tmp_path):
+    db = LocalDB(tmp_path / ".syncme" / "local_state.db")
+    db.set_initialized(True)
+    api = AsyncMock()
+    api.get_state.return_value = {
+        "files": [{"path": "fil1", "revision": 2, "is_deleted": False}],
+        "last_revision": 2
+    }
+    engine = SyncEngine(tmp_path, db, api, exceptions=["fil1", "fil2"])
+
+    # Local file matching exceptions
+    (tmp_path / "fil2").write_text("local exception content")
+    # Local file not matching exceptions
+    (tmp_path / "normal.txt").write_text("normal content")
+    api.upload_file.return_value = {"revision": 3}
+
+    await engine.reconcile()
+
+    # Remote fil1 is ignored -> not downloaded
+    api.download_file.assert_not_called()
+    assert db.get_file("fil1") is None
+
+    # Local fil2 is ignored -> not uploaded
+    # Local normal.txt is uploaded
+    api.upload_file.assert_called_once_with("normal.txt", b"normal content", expected_revision=0)
+    assert db.get_file("fil2") is None
+    assert db.get_file("normal.txt") is not None
+
+@pytest.mark.asyncio
 async def test_reconcile_skip_redownload(sync_engine, tmp_path):
     test_file = tmp_path / "same.txt"
     test_file.write_text("content")

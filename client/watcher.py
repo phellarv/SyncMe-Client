@@ -4,17 +4,18 @@ import threading
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from typing import Callable, Set, Tuple
+from typing import Callable, Set, Tuple, Sequence
 import os
 
 from client.ignore import is_ignored
 
 class SyncEventHandler(FileSystemEventHandler):
-    def __init__(self, sync_dir: Path, callback: Callable[[str, str], None], replace_symlinks: bool = False):
+    def __init__(self, sync_dir: Path, callback: Callable[[str, str], None], replace_symlinks: bool = False, exceptions: Sequence[str] = ()):
         self.sync_dir = sync_dir
         self.watch_dir = self.sync_dir.resolve()
         self.callback = callback
         self.replace_symlinks = replace_symlinks
+        self.exceptions = tuple(exceptions or ())
 
     def _get_rel_path(self, path: str) -> str:
         p = Path(path)
@@ -36,8 +37,8 @@ class SyncEventHandler(FileSystemEventHandler):
             src_rel = self._get_rel_path(event.src_path)
             dest_rel = self._get_rel_path(event.dest_path)
 
-            src_valid = bool(src_rel and not is_ignored(self.sync_dir, src_rel) and (self.replace_symlinks or not os.path.islink(event.src_path)))
-            dest_valid = bool(dest_rel and not is_ignored(self.sync_dir, dest_rel) and (self.replace_symlinks or not os.path.islink(event.dest_path)))
+            src_valid = bool(src_rel and not is_ignored(self.sync_dir, src_rel, self.exceptions) and (self.replace_symlinks or not os.path.islink(event.src_path)))
+            dest_valid = bool(dest_rel and not is_ignored(self.sync_dir, dest_rel, self.exceptions) and (self.replace_symlinks or not os.path.islink(event.dest_path)))
 
             if src_valid and dest_valid:
                 self.callback(src_rel, "deleted")
@@ -51,7 +52,7 @@ class SyncEventHandler(FileSystemEventHandler):
         if not self.replace_symlinks and os.path.islink(event.src_path):
             return
         rel_path = self._get_rel_path(event.src_path)
-        if not rel_path or is_ignored(self.sync_dir, rel_path):
+        if not rel_path or is_ignored(self.sync_dir, rel_path, self.exceptions):
             return
 
         if event_type in ("modified", "created"):
@@ -70,12 +71,13 @@ class SyncEventHandler(FileSystemEventHandler):
 
 class Watcher:
     def __init__(self, sync_dir: Path, debounce_seconds: float = 1.0, replace_symlinks: bool = False,
-                 recursive: bool = True):
+                 recursive: bool = True, exceptions: Sequence[str] = ()):
         self.sync_dir = sync_dir
         self.watch_dir = self.sync_dir.resolve()
         self.debounce_seconds = debounce_seconds
         self.replace_symlinks = replace_symlinks
         self.recursive = recursive
+        self.exceptions = tuple(exceptions or ())
         self.observer = Observer()
         self.events: Set[Tuple[str, str]] = set()
         self._lock = threading.Lock()
@@ -97,7 +99,7 @@ class Watcher:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
                 self._loop = None
-        handler = SyncEventHandler(self.sync_dir, self._on_event, self.replace_symlinks)
+        handler = SyncEventHandler(self.sync_dir, self._on_event, self.replace_symlinks, exceptions=self.exceptions)
         self.observer.schedule(handler, str(self.watch_dir), recursive=self.recursive)
         self.observer.start()
 

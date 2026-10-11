@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, List
 from urllib.parse import urlparse
 import httpx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 class ServerConfig(BaseModel):
     url: str = "http://localhost:8000"
@@ -115,6 +115,28 @@ class DirectoryConfig(BaseModel):
     local_path: Path = Field(default_factory=lambda: Path("~/.syncme_data").expanduser())
     conflict_strategy: str = "ask"
     replace_symlinks: bool = False
+    exceptions: List[str] = Field(default_factory=list)
+
+    @field_validator("exceptions", mode="before")
+    @classmethod
+    def parse_exceptions(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = v.split(",")
+        if isinstance(v, list):
+            res = []
+            for item in v:
+                if not isinstance(item, str):
+                    raise ValueError(f"exceptions must contain strings, got {type(item).__name__}")
+                cleaned = item.strip()
+                if not cleaned:
+                    continue
+                if cleaned.startswith("!"):
+                    raise ValueError("exception patterns cannot start with '!'")
+                res.append(cleaned)
+            return res
+        raise ValueError(f"exceptions must be a string or list of strings, got {type(v).__name__}")
 
     @model_validator(mode='after')
     def expand_local_path(self):

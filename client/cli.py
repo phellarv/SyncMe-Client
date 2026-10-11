@@ -21,7 +21,7 @@ def _get_engines(directory=None):
         db_path = sync_dir / ".syncme" / "local_state.db"
         db = LocalDB(db_path)
         api = APIClient(settings.SERVER_URL, settings.API_KEY, settings.CLIENT_ID, workspace_id=d_conf.name, timeout=settings.REQUEST_TIMEOUT)
-        engines.append((d_conf, SyncEngine(sync_dir, db, api, settings.DEBOUNCE_SECONDS, settings.POLL_INTERVAL_SECONDS, replace_symlinks=d_conf.replace_symlinks)))
+        engines.append((d_conf, SyncEngine(sync_dir, db, api, settings.DEBOUNCE_SECONDS, settings.POLL_INTERVAL_SECONDS, replace_symlinks=d_conf.replace_symlinks, exceptions=d_conf.exceptions)))
 
     from collections import defaultdict
     files_by_workspace = defaultdict(list)
@@ -40,6 +40,7 @@ def _get_engines(directory=None):
                 self.conflict_strategy = conflict_strategy
                 self.local_path = local_path
                 self.replace_symlinks = False
+                self.exceptions = []
                 
         d_conf = DummyConf(workspace, files[0].conflict_strategy, get_central_state_dir())
         

@@ -3,6 +3,7 @@ import hashlib
 import os
 import time
 from pathlib import Path
+from typing import Sequence
 import httpx
 
 from client.config import settings
@@ -23,20 +24,24 @@ def get_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 class SyncEngine:
-    def __init__(self, sync_dir: Path, db: LocalDB, api: APIClient, debounce_seconds: float = 1.0, poll_interval_seconds: int = 300, replace_symlinks: bool = False):
+    def __init__(self, sync_dir: Path, db: LocalDB, api: APIClient, debounce_seconds: float = 1.0, poll_interval_seconds: int = 300, replace_symlinks: bool = False, exceptions: Sequence[str] = ()):
         self.sync_dir = sync_dir
         self.db = db
         self.api = api
         self.workspace_id = getattr(api, "workspace_id", None) if isinstance(getattr(api, "workspace_id", None), str) else sync_dir.name
         self.poll_interval_seconds = poll_interval_seconds
         self.replace_symlinks = replace_symlinks
-        self.watcher = Watcher(sync_dir, debounce_seconds, replace_symlinks)
+        self.exceptions = tuple(exceptions or ())
+        self.watcher = Watcher(sync_dir, debounce_seconds, replace_symlinks, exceptions=self.exceptions)
         self._lock = asyncio.Lock()
         self._tasks: set = set()
         self.sse_initial_delay = 1.0   # event stream reconnect backoff (seconds)
         self.sse_max_delay = 60.0
         self.sse_healthy_seconds = 30.0   # a stream open at least this long resets the backoff
         self.sse_clock = time.monotonic   # injectable for tests
+
+    def is_ignored(self, rel_path: str) -> bool:
+        return is_ignored(self.sync_dir, rel_path, self.exceptions)
 
     async def _fetch_verified(self, path: str, expected_sha256: str | None):
         content = await self.api.download_file(path)
@@ -74,7 +79,7 @@ class SyncEngine:
                 try:
                     path = file_info['path']
                     full_path = safe_join(self.sync_dir, path)
-                    if is_ignored(self.sync_dir, path):
+                    if self.is_ignored(path):
                         continue
 
                     remote_rev = file_info['revision']
@@ -275,7 +280,7 @@ class SyncEngine:
             else:
                 active_files = [
                     f for f in self.db.get_all_files()
-                    if not f['is_deleted'] and not is_ignored(self.sync_dir, f['path'])
+                    if not f['is_deleted'] and not self.is_ignored(f['path'])
                 ]
                 missing_files = [
                     f for f in active_files
@@ -308,13 +313,13 @@ class SyncEngine:
 
             # 3. Process local changes
             for root, dirs, files in os.walk(self.sync_dir):
-                dirs[:] = [d for d in dirs if d != ".syncme" and not is_ignored(self.sync_dir, str((Path(root) / d).relative_to(self.sync_dir)).replace(os.sep, "/") + "/")]
+                dirs[:] = [d for d in dirs if d != ".syncme" and not self.is_ignored(str((Path(root) / d).relative_to(self.sync_dir)).replace(os.sep, "/") + "/")]
                     
                 for file in files:
                     full_path = Path(root) / file
                     rel_path = str(full_path.relative_to(self.sync_dir)).replace(os.sep, "/")
                     
-                    if is_ignored(self.sync_dir, rel_path):
+                    if self.is_ignored(rel_path):
                         continue
                     
                     if full_path.is_symlink():
@@ -387,11 +392,11 @@ class SyncEngine:
             # 2. Get local files
             local_files = {}
             for root, dirs, files in os.walk(self.sync_dir):
-                dirs[:] = [d for d in dirs if d != ".syncme" and not is_ignored(self.sync_dir, str((Path(root) / d).relative_to(self.sync_dir)).replace(os.sep, "/") + "/")]
+                dirs[:] = [d for d in dirs if d != ".syncme" and not self.is_ignored(str((Path(root) / d).relative_to(self.sync_dir)).replace(os.sep, "/") + "/")]
                 for file in files:
                     full_path = Path(root) / file
                     rel_path = str(full_path.relative_to(self.sync_dir)).replace(os.sep, "/")
-                    if not is_ignored(self.sync_dir, rel_path):
+                    if not self.is_ignored(rel_path):
                         if full_path.is_symlink():
                             if not self.replace_symlinks:
                                 continue
@@ -415,7 +420,7 @@ class SyncEngine:
             # 3. Process each file
             all_paths = set(remote_files.keys()).union(set(local_files.keys()))
             for rel_path in all_paths:
-                if is_ignored(self.sync_dir, rel_path):
+                if self.is_ignored(rel_path):
                     continue
                     
                 in_remote = rel_path in remote_files

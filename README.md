@@ -188,6 +188,7 @@ You can specify multiple `[[directories]]` blocks to configure multiple synchron
 | `local_path` | `path` | `"~/.syncme_data"` | Local filesystem directory path (supports `~` expansion). |
 | `conflict_strategy` | `string` | `"ask"` | Default conflict strategy (`ask`, `server`, `local`, `both`) during `init`. |
 | `replace_symlinks` | `boolean` | `false` | Whether to upload symlink targets and replace local symlinks with remote files. |
+| `exceptions` | `string` or `list` | `[]` | Local files or patterns excluded from synchronization for this directory (e.g. `"fil1,fil2"` or `["fil1", "fil2"]`). |
 
 #### `[[files]]` Section
 

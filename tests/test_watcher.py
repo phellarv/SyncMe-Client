@@ -192,3 +192,29 @@ async def test_watcher_atomic_rename_from_ignored(tmp_path: Path):
         assert ("target.txt", "modified") in events
     finally:
         watcher.stop()
+
+@pytest.mark.asyncio
+async def test_watcher_ignores_exceptions(tmp_path: Path):
+    sync_dir = tmp_path / "sync_dir"
+    sync_dir.mkdir()
+    watcher = Watcher(sync_dir, debounce_seconds=0.1, exceptions=["fil1", "fil2"])
+    watcher.start()
+    try:
+        # Write ignored file
+        (sync_dir / "fil1").write_text("ignored content")
+        # Write allowed file
+        (sync_dir / "allowed.txt").write_text("allowed content")
+
+        events = []
+        async def collect_events():
+            async for batch_events in watcher.get_batches():
+                for item in batch_events:
+                    events.append(item)
+                if ("allowed.txt", "modified") in events:
+                    break
+
+        await asyncio.wait_for(collect_events(), timeout=2.0)
+        assert ("allowed.txt", "modified") in events
+        assert not any(r == "fil1" for r, _ in events)
+    finally:
+        watcher.stop()

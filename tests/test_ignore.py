@@ -37,3 +37,15 @@ def test_ignore_advanced(tmp_path: Path):
     assert is_ignored(tmp_path, "Somedir/file.txt") is True
     
     assert is_ignored(tmp_path, "Plugins/Cache/file.txt") is True
+
+def test_ignore_extra_patterns(tmp_path: Path):
+    assert is_ignored(tmp_path, "fil1", extra_patterns=["fil1", "fil2"]) is True
+    assert is_ignored(tmp_path, "fil2", extra_patterns=["fil1", "fil2"]) is True
+    assert is_ignored(tmp_path, "fil3", extra_patterns=["fil1", "fil2"]) is False
+    assert is_ignored(tmp_path, "sub/fil1", extra_patterns=["fil1", "fil2"]) is True
+    # Filenames containing # or starting with # are not treated as comments in extra_patterns
+    assert is_ignored(tmp_path, "rapport #1.txt", extra_patterns=["rapport #1.txt"]) is True
+    assert is_ignored(tmp_path, "#notes", extra_patterns=["#notes"]) is True
+    # Default ignores remain ignored regardless
+    assert is_ignored(tmp_path, ".git/config", extra_patterns=["fil1"]) is True
+    assert is_ignored(tmp_path, ".syncme/local_state.db", extra_patterns=["fil1"]) is True
