@@ -596,3 +596,36 @@ async def test_a_deletion_at_exactly_the_local_revision_is_skipped(make_engine):
 
     assert a.read_text() == "kept" and engine.db.get_file("doc.txt")["server_revision"] == 3
     assert _archive_is_empty(engine)
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_of_a_locally_changed_tracked_file_is_kept(make_engine):
+    """
+    Issue #25: Standalone files must not be deleted if they have local modifications
+    (sha256 mismatch with DB recorded sha256).
+    """
+    engine = make_engine()
+    a = engine.root / "doc.txt"
+    a.write_text("locally modified content")
+    engine.db.upsert_file("doc.txt", hashlib.sha256(b"original content").hexdigest(), 16, a.stat().st_mtime - 10, 1, False)
+    engine.api.get_state.return_value = _state(_entry("doc.txt", is_deleted=True, revision=3))
+
+    await engine.reconcile()
+
+    assert a.exists()
+    assert a.read_text() == "locally modified content"
+    assert engine.db.get_file("doc.txt") is not None
+    assert _archive_is_empty(engine)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oserror_on_one_file_does_not_abort_later_files(make_engine):
+    engine = make_engine(names=("a.txt", "b.txt"))
+    (engine.root / "a.txt").mkdir()  # IsADirectoryError when replacing
+    engine.api.get_state.return_value = _state(_entry("a.txt"), _entry("b.txt"))
+
+    await engine.reconcile()
+
+    assert (engine.root / "b.txt").read_bytes() == PAYLOAD
+    assert engine.db.get_last_server_revision() == 0
+

@@ -1,8 +1,14 @@
 import asyncio
+import inspect
+import os
+import time
 import httpx
 import json
 from pathlib import Path
 from typing import AsyncGenerator, Dict, Any, Optional, Union
+
+STREAM_CHUNK_SIZE = 64 * 1024
+STREAM_THRESHOLD = 64 * 1024
 
 class APIClient:
     def __init__(self, server_url: str, api_key: str, client_id: str, workspace_id: str = "default", timeout: float = 300.0):
@@ -16,15 +22,16 @@ class APIClient:
         }
         self.client = httpx.AsyncClient(headers=self.headers, timeout=httpx.Timeout(connect=15.0, read=timeout, write=timeout, pool=15.0))
 
-    async def get_health(self) -> Dict[str, Any]:
-        resp = await self.client.get(f"{self.server_url}/api/v1/health")
-        resp.raise_for_status()
-        return resp.json()
-
     async def get_state(self, since_revision: int = 0) -> Dict[str, Any]:
-        resp = await self.client.get(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/sync/state", params={"since_revision": since_revision})
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await self.client.get(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/sync/state", params={"since_revision": since_revision})
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, getattr(httpx, "TransportError", Exception), getattr(httpx, "NetworkError", Exception)) as e:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1.0 * (2 ** attempt))
 
     async def download_file(self, path: str) -> bytes:
         for attempt in range(3):
@@ -37,30 +44,83 @@ class APIClient:
                     raise
                 await asyncio.sleep(1.0 * (2 ** attempt))
 
+    async def download_file_to_path(self, path: str, target: Path, expected_sha256: Optional[str] = None) -> str:
+        import hashlib
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part_file = target.with_name(f".syncme-tmp-{target.name.lstrip('.')}.part-{time.time_ns()}")
+        try:
+            for attempt in range(3):
+                try:
+                    digest = hashlib.sha256()
+                    async with self.client.stream("GET", f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/files/{path}") as resp:
+                        resp.raise_for_status()
+                        with open(part_file, "wb") as f:
+                            async for chunk in resp.aiter_bytes():
+                                digest.update(chunk)
+                                f.write(chunk)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    hex_digest = digest.hexdigest()
+                    if expected_sha256 and hex_digest != expected_sha256:
+                        part_file.unlink(missing_ok=True)
+                        raise ValueError(f"Hash mismatch for {path}")
+                    os.replace(part_file, target)
+                    return hex_digest
+                except (httpx.TimeoutException, getattr(httpx, "TransportError", Exception), getattr(httpx, "NetworkError", Exception)) as e:
+                    if part_file.exists():
+                        try:
+                            part_file.unlink()
+                        except OSError:
+                            pass
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1.0 * (2 ** attempt))
+        finally:
+            if part_file.exists():
+                try:
+                    part_file.unlink()
+                except OSError:
+                    pass
+
     async def upload_file(self, path: str, content: Union[bytes, Path], expected_revision: Optional[int] = None) -> Dict[str, Any]:
-        if isinstance(content, Path):
-            with open(content, "rb") as f:
-                content = f.read()
         headers = {}
         if expected_revision is not None:
             headers["If-Match"] = str(expected_revision)
         for attempt in range(3):
+            body = None
             try:
-                resp = await self.client.put(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/files/{path}", headers=headers, content=content)
+                if isinstance(content, Path):
+                    async def file_streamer():
+                        with open(content, "rb") as f:
+                            while chunk := f.read(STREAM_CHUNK_SIZE):
+                                yield chunk
+                    body = file_streamer()
+                else:
+                    body = content
+                resp = await self.client.put(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/files/{path}", headers=headers, content=body)
                 resp.raise_for_status()
                 return resp.json()
             except (httpx.TimeoutException, getattr(httpx, "TransportError", Exception), getattr(httpx, "NetworkError", Exception)) as e:
                 if attempt == 2:
                     raise
                 await asyncio.sleep(1.0 * (2 ** attempt))
+            finally:
+                if body is not None and inspect.isasyncgen(body):
+                    await body.aclose()
 
     async def delete_file(self, path: str, expected_revision: Optional[int] = None) -> Dict[str, Any]:
         headers = {}
         if expected_revision is not None:
             headers["If-Match"] = str(expected_revision)
-        resp = await self.client.delete(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/files/{path}", headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await self.client.delete(f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/files/{path}", headers=headers)
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, getattr(httpx, "TransportError", Exception), getattr(httpx, "NetworkError", Exception)) as e:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1.0 * (2 ** attempt))
 
     async def listen_events(self) -> AsyncGenerator[Dict[str, Any], None]:
         async with self.client.stream("GET", f"{self.server_url}/api/v1/workspaces/{self.workspace_id}/events",

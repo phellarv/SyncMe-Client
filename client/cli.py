@@ -183,13 +183,26 @@ def archive():
     """Archive commands"""
     pass
 
+def _get_archive_dirs(d_conf, engine) -> list[Path]:
+    files = getattr(engine, "files", None)
+    if isinstance(files, (list, tuple)) and files:
+        dirs = []
+        for f_conf in files:
+            parent = Path(f_conf.local_path).parent
+            if parent not in dirs:
+                dirs.append(parent)
+        return dirs
+    return [d_conf.local_path]
+
 @archive.command(name="list")
 @click.option('--directory', '-d', help="Specific directory to list archive")
 def archive_list(directory):
     """List archived files"""
     engines = _get_engines(directory)
     for d_conf, engine in engines:
-        archives = list_archive(d_conf.local_path)
+        archives = []
+        for base_dir in _get_archive_dirs(d_conf, engine):
+            archives.extend(list_archive(base_dir))
         click.echo(f"[{d_conf.name}] {len(archives)} archives found:")
         for a in archives:
             click.echo(f"  {a['name']} (size: {a['size']})")
@@ -212,8 +225,18 @@ def archive_restore(archive_name, target_path, directory):
     d_conf, engine = engines[0]
     
     if target_path is None:
-        target_path = archive_name.split("_")[0].replace("__", "/")
-    restore_file(d_conf.local_path, archive_name, target_path)
+        target_path = archive_name.rsplit("_", 1)[0].replace("__", "/")
+    restored = False
+    last_err = None
+    for base_dir in _get_archive_dirs(d_conf, engine):
+        try:
+            restore_file(base_dir, archive_name, target_path)
+            restored = True
+            break
+        except FileNotFoundError as e:
+            last_err = e
+    if not restored and last_err is not None:
+        raise last_err
     click.echo(f"Restored {archive_name} to {target_path} in {d_conf.name}")
 
 
@@ -244,10 +267,14 @@ def get_conflict_resolver(workspace: str = None, db=None):
     if not db:
         for item in get_local_dbs():
             w, d = item if isinstance(item, tuple) else ("default", item)
-            if w == workspace or not workspace:
+            if db is None and (w == workspace or not workspace):
                 db = d
                 workspace = w
-                break
+            else:
+                try:
+                    d.close()
+                except Exception:
+                    pass
     if not db:
         return None
     
@@ -259,21 +286,32 @@ def conflicts():
     """Manage conflicts"""
     pass
 
+def _close_dbs(dbs):
+    for item in dbs:
+        db = item[1] if isinstance(item, tuple) else item
+        try:
+            db.close()
+        except Exception:
+            pass
+
 @conflicts.command(name="list")
 def conflicts_list():
     """List all pending conflicts"""
     dbs = get_local_dbs()
-    found = False
-    for item in dbs:
-        workspace, db = item if isinstance(item, tuple) else ("default", item)
-        pending = db.get_pending_conflicts(workspace)
-        if pending:
-            found = True
-            click.echo(f"Workspace: {workspace}")
-            for c in pending:
-                click.echo(f"  [{c['id']}] {c['rel_path']}")
-    if not found:
-        click.echo("No pending conflicts found.")
+    try:
+        found = False
+        for item in dbs:
+            workspace, db = item if isinstance(item, tuple) else ("default", item)
+            pending = db.get_pending_conflicts(workspace)
+            if pending:
+                found = True
+                click.echo(f"Workspace: {workspace}")
+                for c in pending:
+                    click.echo(f"  [{c['id']}] {c['rel_path']}")
+        if not found:
+            click.echo("No pending conflicts found.")
+    finally:
+        _close_dbs(dbs)
 
 @conflicts.command(name="count")
 @click.option('--format', type=click.Choice(['plain', 'waybar', 'json']), default='plain')
@@ -281,35 +319,39 @@ def conflicts_count(format):
     """Count pending conflicts"""
     import json
     dbs = get_local_dbs()
-    count = 0
-    all_conflicts = []
-    for item in dbs:
-        workspace, db = item if isinstance(item, tuple) else ("default", item)
-        count += db.count_pending_conflicts(workspace)
-        if format != 'plain':
-            all_conflicts.extend(db.get_pending_conflicts(workspace))
-        
-    if format == 'plain':
-        click.echo(str(count))
-    elif format == 'waybar':
-        res = {
-            "text": f"⚠️ {count}" if count > 0 else "✔",
-            "tooltip": f"{count} conflicts pending" if count > 0 else "All synced",
-            "class": "warning" if count > 0 else "synced"
-        }
-        click.echo(json.dumps(res))
-    elif format == 'json':
-        res = {
-            "count": count,
-            "conflicts": all_conflicts
-        }
-        click.echo(json.dumps(res))
+    try:
+        count = 0
+        all_conflicts = []
+        for item in dbs:
+            workspace, db = item if isinstance(item, tuple) else ("default", item)
+            count += db.count_pending_conflicts(workspace)
+            if format != 'plain':
+                all_conflicts.extend(db.get_pending_conflicts(workspace))
+            
+        if format == 'plain':
+            click.echo(str(count))
+        elif format == 'waybar':
+            res = {
+                "text": f"⚠️ {count}" if count > 0 else "✔",
+                "tooltip": f"{count} conflicts pending" if count > 0 else "All synced",
+                "class": "warning" if count > 0 else "synced"
+            }
+            click.echo(json.dumps(res))
+        elif format == 'json':
+            res = {
+                "count": count,
+                "conflicts": all_conflicts
+            }
+            click.echo(json.dumps(res))
+    finally:
+        _close_dbs(dbs)
 
 @conflicts.command(name="resolve")
 def conflicts_resolve():
     """Interactively resolve conflicts"""
+    dbs = get_local_dbs()
+
     async def _async_resolve():
-        dbs = get_local_dbs()
         found = False
         opened_resolvers = []
         try:
@@ -331,7 +373,7 @@ def conflicts_resolve():
                     diff_str = format_inline_diff(c.get('server_file'), c.get('conflict_file'))
                     click.echo(diff_str)
                     
-                    choice = click.prompt("Choose action: [s]erver wins, [l]ocal wins, [n]ext, [q]uit", type=click.Choice(['s', 'l', 'n', 'q']))
+                    choice = click.prompt("Choose action: [s]erver wins, [l]ocal wins, [m]eld, [d]ismiss, [n]ext, [q]uit", type=click.Choice(['s', 'l', 'm', 'd', 'n', 'q']))
                     
                     if choice == 'q':
                         return found
@@ -341,6 +383,10 @@ def conflicts_resolve():
                         action = 'local'
                     elif choice == 's':
                         action = 'server'
+                    elif choice == 'm':
+                        action = 'meld'
+                    elif choice == 'd':
+                        action = 'dismiss'
                         
                     try:
                         res = resolver.resolve_conflict(c['id'], action)
@@ -360,9 +406,35 @@ def conflicts_resolve():
                     if asyncio.iscoroutine(res2):
                         await res2
 
-    found = asyncio.run(_async_resolve())
-    if not found:
-        click.echo("No pending conflicts found.")
+    try:
+        found = asyncio.run(_async_resolve())
+        if not found:
+            click.echo("No pending conflicts found.")
+    finally:
+        _close_dbs(dbs)
+
+def _find_file_in_engines(engines, file_path):
+    file_path_obj = Path(file_path).resolve()
+    # 1. Exact match against standalone configured files first
+    for d_conf, engine in engines:
+        files = getattr(engine, "files", None)
+        if isinstance(files, (list, tuple)):
+            for f_conf in files:
+                if Path(f_conf.local_path).resolve() == file_path_obj:
+                    return engine, str(f_conf.remote_path).replace("\\", "/"), Path(f_conf.local_path).resolve()
+    # 2. Directory prefix match for directory sync engines
+    for d_conf, engine in engines:
+        files = getattr(engine, "files", None)
+        if isinstance(files, (list, tuple)):
+            continue
+        local_path = Path(d_conf.local_path).resolve()
+        try:
+            rel_path = file_path_obj.relative_to(local_path)
+            resolved_path = str(rel_path).replace("\\", "/")
+            return engine, resolved_path, file_path_obj
+        except ValueError:
+            pass
+    return None, None, None
 
 @cli.command()
 @click.argument("file_path")
@@ -376,21 +448,7 @@ def history(file_path: str, limit: int, directory: str):
         click.echo(f"Directory '{directory}' not found in config.")
         return
         
-    engine_match = None
-    resolved_path = None
-    
-    file_path_obj = Path(file_path).resolve()
-    
-    for d_conf, engine in engines:
-        local_path = Path(d_conf.local_path).resolve()
-        try:
-            rel_path = file_path_obj.relative_to(local_path)
-            engine_match = engine
-            resolved_path = str(rel_path).replace("\\", "/")
-            break
-        except ValueError:
-            pass
-            
+    engine_match, resolved_path, _ = _find_file_in_engines(engines, file_path)
     if not engine_match:
         click.echo(f"File {file_path} is not in any configured sync directory.")
         sys.exit(1)
@@ -421,6 +479,11 @@ def history(file_path: str, limit: int, directory: str):
             click.echo(f"Error fetching history: {e}")
             sys.exit(1)
         finally:
+            if hasattr(engine, "db") and hasattr(engine.db, "close"):
+                try:
+                    engine.db.close()
+                except Exception:
+                    pass
             await engine.api.close()
             
     _run_guarded(_get_history(engine_match, resolved_path, limit))
@@ -437,40 +500,76 @@ def restore(file_path: str, revision: int, directory: str):
         click.echo(f"Directory '{directory}' not found in config.")
         return
         
-    engine_match = None
-    resolved_path = None
-    
-    file_path_obj = Path(file_path).resolve()
-    
-    for d_conf, engine in engines:
-        local_path = Path(d_conf.local_path).resolve()
-        try:
-            rel_path = file_path_obj.relative_to(local_path)
-            engine_match = engine
-            resolved_path = str(rel_path).replace("\\", "/")
-            break
-        except ValueError:
-            pass
-            
+    engine_match, resolved_path, target_local_path = _find_file_in_engines(engines, file_path)
     if not engine_match:
         click.echo(f"File {file_path} is not in any configured sync directory.")
         sys.exit(1)
         
-    async def _restore(engine, path, rev):
+    async def _restore(engine, path, rev, local_target):
+        new_rev = None
         try:
             local_file = engine.db.get_file(path)
             expected_revision = local_file.get("server_revision") if local_file else None
             
             result = await engine.api.restore_history(path, rev, expected_revision=expected_revision)
-            new_rev = result.get("revision") or result.get("new_revision")
+            new_rev = result.get("revision") if result.get("revision") is not None else result.get("new_revision")
+            expected_sha256 = result.get("sha256")
+            
+            content = await engine.api.download_file(path)
+            from client.pathsafe import sha256_matches
+            if not sha256_matches(content, expected_sha256):
+                raise ValueError(f"Hash mismatch for restored file {path}")
+            
+            import tempfile
+            import os
+            import hashlib
+            import stat as stat_module
+            
+            old_mode = None
+            if local_target.exists():
+                try:
+                    old_mode = stat_module.S_IMODE(local_target.stat().st_mode)
+                except OSError:
+                    pass
+            
+            local_target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = tempfile.NamedTemporaryFile(dir=local_target.parent, prefix=".syncme-tmp-", delete=False)
+            tmp_path = Path(tmp.name)
+            try:
+                with tmp:
+                    tmp.write(content)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                if old_mode is not None:
+                    try:
+                        os.chmod(tmp_path, old_mode)
+                    except OSError:
+                        pass
+                tmp_path.replace(local_target)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+                
+            sha = hashlib.sha256(content).hexdigest()
+            stat = local_target.stat()
+            engine.db.upsert_file(path, sha, stat.st_size, stat.st_mtime, new_rev, False)
+            
             click.echo(f"Successfully restored {path} to revision {rev}. Server created new revision {new_rev}.")
         except Exception as e:
-            click.echo(f"Error restoring file: {e}")
+            if new_rev is not None:
+                click.echo(f"Restored to revision {new_rev} on server, but local update failed: {e}. Run sync to update.")
+            else:
+                click.echo(f"Error restoring file: {e}")
             sys.exit(1)
         finally:
+            if hasattr(engine, "db") and hasattr(engine.db, "close"):
+                try:
+                    engine.db.close()
+                except Exception:
+                    pass
             await engine.api.close()
             
-    _run_guarded(_restore(engine_match, resolved_path, revision))
+    _run_guarded(_restore(engine_match, resolved_path, revision, target_local_path))
 
 if __name__ == "__main__":
     cli()

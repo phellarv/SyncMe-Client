@@ -157,19 +157,54 @@ class TestLocalDBConflictQueue:
         assert len(db.get_pending_conflicts()) == 0
         db.close()
 
-    def test_duplicate_pending_conflict_updates_existing(self, tmp_path: Path):
-        """Criterion: Duplicate pending conflict for same workspace and rel_path updates/returns existing record."""
+    def test_get_pending_conflicts_does_not_mutate_db(self, tmp_path: Path):
+        """Criterion: get_pending_conflicts does not execute write transactions on missing files."""
         db = LocalDB(tmp_path / "test.db")
-        (tmp_path / "c_old").touch()
-        (tmp_path / "c_new").touch()
-        cid1 = db.record_conflict("ws1", "file.txt", "/s_old", str(tmp_path / "c_old"))
-        cid2 = db.record_conflict("ws1", "file.txt", "/s_new", str(tmp_path / "c_new"))
+        c_file = tmp_path / "c"
+        c_file.touch()
+        cid = db.record_conflict("default", "file.txt", "/s", str(c_file))
+        c_file.unlink()
+
+        assert len(db.get_pending_conflicts()) == 0
+        raw = db.get_conflict(cid)
+        assert raw["status"] == "pending"
+
+        pruned = db.prune_missing_conflicts()
+        assert pruned == 1
+        raw_after = db.get_conflict(cid)
+        assert raw_after["status"] == "dismissed"
+
+        # Check workspace filtering and that existing files are not pruned
+        c2 = tmp_path / "c2"
+        c2.touch()
+        cid2 = db.record_conflict("ws2", "file2.txt", "/s2", str(c2))
+        cid3 = db.record_conflict("ws1", "file3.txt", "/s3", str(tmp_path / "nonexistent"))
+
+        pruned_ws2 = db.prune_missing_conflicts(workspace="ws2")
+        assert pruned_ws2 == 0  # c2 exists, so not pruned
+        assert db.get_conflict(cid2)["status"] == "pending"
+
+        pruned_ws1 = db.prune_missing_conflicts(workspace="ws1")
+        assert pruned_ws1 == 1  # nonexistent in ws1 pruned
+        assert db.get_conflict(cid3)["status"] == "dismissed"
+        db.close()
+
+    def test_duplicate_pending_conflict_updates_existing(self, tmp_path: Path):
+        """Criterion: Duplicate pending conflict for same workspace and rel_path updates/returns existing record and preserves old conflict file on disk."""
+        db = LocalDB(tmp_path / "test.db")
+        c_old = tmp_path / "c_old"
+        c_new = tmp_path / "c_new"
+        c_old.write_text("first conflict data")
+        c_new.write_text("second conflict data")
+        cid1 = db.record_conflict("ws1", "file.txt", "/s_old", str(c_old))
+        cid2 = db.record_conflict("ws1", "file.txt", "/s_new", str(c_new))
 
         assert cid1 == cid2
         assert db.count_pending_conflicts("ws1") == 1
+        assert c_old.exists() and c_old.read_text() == "first conflict data"
 
         record = db.get_conflict(cid1)
-        assert record["conflict_file"] == str(tmp_path / "c_new")
+        assert record["conflict_file"] == str(c_new)
         assert record["server_file"] == "/s_new"
         db.close()
 
@@ -575,3 +610,140 @@ def test_format_inline_diff_truncation(tmp_path):
     c.write_text("\n".join(str(i) for i in range(100, 200)))
     diff = format_inline_diff(s, c, max_lines=10)
     assert "(truncated remaining diff lines)" in diff
+
+
+def test_cli_conflicts_commands_close_db_connections():
+    """Criterion: conflicts list, count, and resolve close database connections."""
+    runner = CliRunner()
+
+    # 1. conflicts list
+    with patch("client.cli.get_local_dbs") as mock_get_dbs:
+        mock_db = MagicMock()
+        mock_db.get_pending_conflicts.return_value = []
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        result = runner.invoke(cli, ["conflicts", "list"])
+        assert result.exit_code == 0
+        mock_db.close.assert_called_once()
+
+    # 2. conflicts count
+    with patch("client.cli.get_local_dbs") as mock_get_dbs:
+        mock_db = MagicMock()
+        mock_db.count_pending_conflicts.return_value = 0
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        result = runner.invoke(cli, ["conflicts", "count"])
+        assert result.exit_code == 0
+        mock_db.close.assert_called_once()
+
+    # 3. conflicts resolve (empty pending)
+    with patch("client.cli.get_local_dbs") as mock_get_dbs, \
+         patch("client.cli.get_conflict_resolver") as mock_resolver:
+        mock_db = MagicMock()
+        mock_db.get_pending_conflicts.return_value = []
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        mock_resolver.return_value = MagicMock()
+        result = runner.invoke(cli, ["conflicts", "resolve"])
+        assert result.exit_code == 0
+        mock_db.close.assert_called_once()
+
+
+def test_cli_conflicts_commands_close_db_on_error():
+    """Criterion: conflicts list, count, and resolve close database connections even on errors."""
+    runner = CliRunner()
+
+    # 1. conflicts list raises exception
+    with patch("client.cli.get_local_dbs") as mock_get_dbs:
+        mock_db = MagicMock()
+        mock_db.get_pending_conflicts.side_effect = RuntimeError("db error")
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        result = runner.invoke(cli, ["conflicts", "list"])
+        assert result.exit_code != 0
+        mock_db.close.assert_called_once()
+
+    # 2. conflicts count raises exception
+    with patch("client.cli.get_local_dbs") as mock_get_dbs:
+        mock_db = MagicMock()
+        mock_db.count_pending_conflicts.side_effect = RuntimeError("db error")
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        result = runner.invoke(cli, ["conflicts", "count"])
+        assert result.exit_code != 0
+        mock_db.close.assert_called_once()
+
+    # 3. conflicts resolve raises exception
+    with patch("client.cli.get_local_dbs") as mock_get_dbs, \
+         patch("client.cli.get_conflict_resolver") as mock_resolver:
+        mock_db = MagicMock()
+        mock_resolver.side_effect = RuntimeError("resolver error")
+        mock_get_dbs.return_value = [("ws", mock_db)]
+        result = runner.invoke(cli, ["conflicts", "resolve"])
+        assert result.exit_code != 0
+        mock_db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_conflict_local_passes_expected_revision_and_preserves_on_failure(tmp_path: Path):
+    db = LocalDB(tmp_path / "test.db")
+    db.upsert_file("doc.txt", "oldsha", 14, 100.0, 7, False)
+    api = AsyncMock()
+    resolver = ConflictResolver(db=db, api=api)
+
+    server_file = tmp_path / "doc.txt"
+    conflict_file = tmp_path / "doc.conflict.123.txt"
+    server_file.write_text("server version")
+    conflict_file.write_text("local conflict version")
+
+    cid = db.record_conflict("default", "doc.txt", str(server_file), str(conflict_file))
+
+    # 1. When upload fails (returns None), server_file and conflict_file are untouched
+    api.upload_file.return_value = None
+    ok = await resolver.resolve_conflict(cid, "local")
+    assert ok is False
+    assert server_file.read_text() == "server version"
+    assert conflict_file.read_text() == "local conflict version"
+    api.upload_file.assert_called_once_with("doc.txt", str(conflict_file), expected_revision=7)
+
+    # 2. When upload succeeds, server_file is updated and conflict_file is unlinked
+    api.upload_file.reset_mock()
+    api.upload_file.return_value = {"revision": 8}
+    ok = await resolver.resolve_conflict(cid, "local")
+    assert ok is True
+    assert server_file.read_text() == "local conflict version"
+    assert not conflict_file.exists()
+    api.upload_file.assert_called_once_with("doc.txt", str(conflict_file), expected_revision=7)
+    db.close()
+
+
+def test_cli_conflicts_resolve_meld_and_dismiss():
+    runner = CliRunner()
+    with patch("client.cli.get_local_dbs") as mock_get_dbs, \
+         patch("client.cli.get_conflict_resolver") as mock_get_resolver, \
+         patch("client.cli.format_inline_diff", return_value="mock diff"):
+        mock_db = MagicMock()
+        mock_db.get_pending_conflicts.return_value = [
+            {"id": 1, "workspace": "default", "rel_path": "a.txt", "server_file": "/tmp/s1", "conflict_file": "/tmp/c1"},
+            {"id": 2, "workspace": "default", "rel_path": "b.txt", "server_file": "/tmp/s2", "conflict_file": "/tmp/c2"},
+        ]
+        mock_get_dbs.return_value = [("default", mock_db)]
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve_conflict = AsyncMock(return_value=True)
+        mock_resolver.api = MagicMock()
+        mock_resolver.api.close = AsyncMock()
+        mock_get_resolver.return_value = mock_resolver
+
+        result = runner.invoke(cli, ["conflicts", "resolve"], input="m\nd\n")
+        assert result.exit_code == 0
+        assert mock_resolver.resolve_conflict.call_args_list[0][0] == (1, "meld")
+        assert mock_resolver.resolve_conflict.call_args_list[1][0] == (2, "dismiss")
+
+
+def test_get_conflict_resolver_closes_non_matching_dbs():
+    from client.cli import get_conflict_resolver
+    db1 = MagicMock()
+    db2 = MagicMock()
+    with patch("client.cli.get_local_dbs", return_value=[("ws1", db1), ("ws2", db2)]):
+        resolver = get_conflict_resolver(workspace="ws2")
+        assert resolver is not None
+        assert resolver.db is db2
+        db1.close.assert_called_once()
+        db2.close.assert_not_called()
+        asyncio.run(resolver.api.close())

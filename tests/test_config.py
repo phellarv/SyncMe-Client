@@ -101,3 +101,10 @@ def test_directory_exceptions_validation_errors(tmp_path, monkeypatch):
     # Non-strings in list are disallowed
     with pytest.raises(ValidationError):
         DirectoryConfig(exceptions=[123])
+
+
+def test_dead_code_removed():
+    from client.config import ClientConfig
+    from client.api import APIClient
+    assert "SYNC_DIR" not in ClientConfig.__dict__
+    assert not hasattr(APIClient, "get_health")

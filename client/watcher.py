@@ -29,10 +29,26 @@ class SyncEventHandler(FileSystemEventHandler):
             return ""
 
     def _handle_event(self, event):
+        event_type = event.event_type
         if event.is_directory:
+            if event_type == "moved":
+                src_rel = self._get_rel_path(event.src_path)
+                dest_rel = self._get_rel_path(event.dest_path)
+                if src_rel and not is_ignored(self.sync_dir, src_rel, self.exceptions):
+                    self.callback(src_rel.replace(os.sep, "/"), "deleted")
+                if dest_rel and not is_ignored(self.sync_dir, dest_rel, self.exceptions):
+                    dest_p = Path(event.dest_path)
+                    if dest_p.is_dir():
+                        for f_path in dest_p.rglob("*"):
+                            if f_path.is_dir():
+                                continue
+                            if not self.replace_symlinks and os.path.islink(f_path):
+                                continue
+                            f_rel = self._get_rel_path(str(f_path))
+                            if f_rel and not is_ignored(self.sync_dir, f_rel, self.exceptions):
+                                self.callback(f_rel.replace(os.sep, "/"), "modified")
             return
 
-        event_type = event.event_type
         if event_type == "moved":
             src_rel = self._get_rel_path(event.src_path)
             dest_rel = self._get_rel_path(event.dest_path)
@@ -88,8 +104,9 @@ class Watcher:
         print(f"[Watcher] Event detected: {event_type} on {rel_path}", flush=True)
         with self._lock:
             self.events.add((rel_path, event_type))
-        if self._loop is not None and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._event_queue.put_nowait, (rel_path, event_type))
+            loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._event_queue.put_nowait, (rel_path, event_type))
 
     def start(self, loop=None):
         if loop is not None:
@@ -109,15 +126,16 @@ class Watcher:
         # self.observer.join(timeout=1.0)
 
     async def get_batches(self):
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
         with self._lock:
+            if self._loop is None or self._loop.is_closed():
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
             if self.events and self._event_queue.empty():
                 for item in self.events:
                     self._event_queue.put_nowait(item)
+                self.events.clear()
         while True:
             # Wait until at least one event arrives (zero idle CPU usage)
             first = await self._event_queue.get()

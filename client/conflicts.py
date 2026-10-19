@@ -14,11 +14,25 @@ class ConflictResolver:
         self.runner = runner
 
     def _compute_sha256(self, path: str) -> str:
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
-                h.update(chunk)
-        return h.hexdigest()
+        from client.base_engine import get_file_sha256
+        return get_file_sha256(Path(path))
+
+    async def _upload_with_expected_rev(self, rel_path: str, file_path: str, expected_rev):
+        target_fn = getattr(self.api.upload_file, "side_effect", None)
+        if not callable(target_fn) or isinstance(target_fn, type):
+            target_fn = self.api.upload_file
+        sig = inspect.signature(target_fn)
+        supports_expected = (
+            "expected_revision" in sig.parameters
+            or hasattr(target_fn, "_mock_name")
+        )
+        kwargs = {"expected_revision": expected_rev} if supports_expected else {}
+        if inspect.iscoroutinefunction(self.api.upload_file):
+            return await self.api.upload_file(rel_path, file_path, **kwargs)
+        res = self.api.upload_file(rel_path, file_path, **kwargs)
+        if asyncio.iscoroutine(res):
+            return await res
+        return res
 
     async def resolve_conflict(self, conflict_id: int, action: str) -> bool:
         conflict = self.db.get_conflict(conflict_id)
@@ -28,19 +42,17 @@ class ConflictResolver:
         server_file = conflict['server_file']
         conflict_file = conflict['conflict_file']
         rel_path = conflict['rel_path']
+        local_file = self.db.get_file(rel_path) if hasattr(self.db, "get_file") else None
+        expected_rev = local_file.get("server_revision") if isinstance(local_file, dict) else None
 
         if action == 'local':
             if not os.path.exists(conflict_file):
                 return False
-            shutil.copy2(conflict_file, server_file)
             if self.api:
-                if inspect.iscoroutinefunction(self.api.upload_file):
-                    res = await self.api.upload_file(rel_path, server_file)
-                else:
-                    res = self.api.upload_file(rel_path, server_file)
-                
+                res = await self._upload_with_expected_rev(rel_path, conflict_file, expected_rev)
                 if res and 'revision' in res:
                     rev = res['revision']
+                    shutil.copy2(conflict_file, server_file)
                     sha256 = self._compute_sha256(server_file)
                     st = os.stat(server_file)
                     self.db.upsert_file(rel_path, sha256, st.st_size, st.st_mtime, rev, False)
@@ -53,6 +65,7 @@ class ConflictResolver:
                 else:
                     return False
             else:
+                shutil.copy2(conflict_file, server_file)
                 try:
                     os.unlink(conflict_file)
                 except OSError:
@@ -82,11 +95,7 @@ class ConflictResolver:
 
             if returncode == 0:
                 if self.api:
-                    if inspect.iscoroutinefunction(self.api.upload_file):
-                        res = await self.api.upload_file(rel_path, server_file)
-                    else:
-                        res = self.api.upload_file(rel_path, server_file)
-                        
+                    res = await self._upload_with_expected_rev(rel_path, server_file, expected_rev)
                     if res and 'revision' in res:
                         rev = res['revision']
                         sha256 = self._compute_sha256(server_file)

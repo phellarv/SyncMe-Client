@@ -141,6 +141,104 @@ async def test_notification_local_action(tmp_path: Path):
     on_resolve.assert_called_once_with("notes.txt", "local")
 
 
+@pytest.mark.asyncio
+async def test_notification_local_action_retains_conflict_file_if_on_resolve_fails(tmp_path: Path):
+    """
+    Issue #29: When on_resolve fails (e.g. network error during upload),
+    conflict_file must NOT be deleted so local user changes are not permanently lost.
+    """
+    server_file = tmp_path / "notes.txt"
+    conflict_file = tmp_path / "notes.conflict.999.txt"
+    server_file.write_text("old server content")
+    conflict_file.write_text("new local content to keep")
+
+    async def mock_runner(*args, **kwargs):
+        cmd = list(args[0]) if len(args) == 1 and isinstance(args[0], (list, tuple)) else list(args)
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "notify-send" in cmd_str:
+            return CommandResult(0, "local\n", "")
+        return CommandResult(0, "", "")
+
+    async def failing_on_resolve(rel_path, action):
+        raise ConnectionError("Server upload failed")
+
+    await handle_conflict_notification(
+        workspace="default",
+        rel_path="notes.txt",
+        server_file=server_file,
+        conflict_file=conflict_file,
+        on_resolve=failing_on_resolve,
+        runner=mock_runner,
+    )
+
+    # Conflict file must still exist and server_file must not be corrupted because upload failed!
+    assert conflict_file.exists()
+    assert conflict_file.read_text() == "new local content to keep"
+    assert server_file.read_text() == "old server content"
+
+
+@pytest.mark.asyncio
+async def test_notification_meld_action_retains_conflict_file_if_on_resolve_fails(tmp_path: Path):
+    """Meld action retains conflict file if on_resolve callback fails."""
+    server_file = tmp_path / "notes.txt"
+    conflict_file = tmp_path / "notes.conflict.txt"
+    server_file.write_text("server content")
+    conflict_file.write_text("local content")
+
+    async def mock_runner(*args, **kwargs):
+        cmd = list(args[0]) if len(args) == 1 and isinstance(args[0], (list, tuple)) else list(args)
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "notify-send" in cmd_str:
+            return CommandResult(0, "meld\n", "")
+        if "meld" in cmd_str:
+            return CommandResult(0, "", "")
+        return CommandResult(0, "", "")
+
+    async def failing_on_resolve(rel_path, action):
+        raise ConnectionError("Server upload failed")
+
+    await handle_conflict_notification(
+        workspace="default",
+        rel_path="notes.txt",
+        server_file=server_file,
+        conflict_file=conflict_file,
+        on_resolve=failing_on_resolve,
+        runner=mock_runner,
+    )
+
+    assert conflict_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_notification_server_action_retains_conflict_file_if_on_resolve_fails(tmp_path: Path):
+    """Server action retains conflict file if on_resolve callback fails."""
+    server_file = tmp_path / "notes.txt"
+    conflict_file = tmp_path / "notes.conflict.txt"
+    server_file.write_text("server content")
+    conflict_file.write_text("local content")
+
+    async def mock_runner(*args, **kwargs):
+        cmd = list(args[0]) if len(args) == 1 and isinstance(args[0], (list, tuple)) else list(args)
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "notify-send" in cmd_str:
+            return CommandResult(0, "server\n", "")
+        return CommandResult(0, "", "")
+
+    async def failing_on_resolve(rel_path, action):
+        raise ConnectionError("Server update failed")
+
+    await handle_conflict_notification(
+        workspace="default",
+        rel_path="notes.txt",
+        server_file=server_file,
+        conflict_file=conflict_file,
+        on_resolve=failing_on_resolve,
+        runner=mock_runner,
+    )
+
+    assert conflict_file.exists()
+
+
 # ---------------------------------------------------------------------------
 # Criterion 3: Server Action
 # ---------------------------------------------------------------------------

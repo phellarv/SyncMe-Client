@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import tomllib
+import unicodedata
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import urlparse
@@ -157,6 +158,8 @@ class FileConfig(BaseModel):
             self.local_path = Path(os.path.expanduser(str(self.local_path)))
         if not self.remote_path and self.local_path:
             self.remote_path = self.local_path.name
+        if self.remote_path:
+            self.remote_path = unicodedata.normalize("NFC", self.remote_path.lstrip("/"))
         return self
 
 class ClientConfig(BaseModel):
@@ -164,9 +167,27 @@ class ClientConfig(BaseModel):
     directories: List[DirectoryConfig] = Field(default_factory=lambda: [DirectoryConfig()])
     files: List[FileConfig] = Field(default_factory=list)
 
-    @property
-    def SYNC_DIR(self) -> Path:
-        return self.directories[0].local_path
+    @model_validator(mode='after')
+    def validate_no_collisions(self):
+        dir_names = set()
+        for d in self.directories:
+            if d.name in dir_names:
+                raise ConfigError(f"Duplicate directory workspace name: {d.name}")
+            dir_names.add(d.name)
+
+        seen_files = set()
+        for f in self.files:
+            if f.workspace in dir_names:
+                raise ConfigError(
+                    f"File workspace '{f.workspace}' collides with directory workspace of the same name"
+                )
+            key = (f.workspace, f.remote_path)
+            if key in seen_files:
+                raise ConfigError(
+                    f"Duplicate remote_path '{f.remote_path}' in workspace '{f.workspace}'"
+                )
+            seen_files.add(key)
+        return self
 
     @property
     def SERVER_URL(self) -> str: return self.server.url

@@ -12,6 +12,12 @@ class LocalDB:
         self.conn.execute("PRAGMA busy_timeout=5000;")
         self._init_db()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def _init_db(self):
         with self.conn:
             self.conn.execute("""
@@ -117,10 +123,13 @@ class LocalDB:
             row = cur.fetchone()
             if row:
                 conflict_id = row['id']
-                old_conflict_file = row['conflict_file']
-                if old_conflict_file and old_conflict_file != conflict_file:
+                prev_conflict = row['conflict_file']
+                if prev_conflict and prev_conflict != conflict_file:
                     try:
-                        Path(old_conflict_file).unlink(missing_ok=True)
+                        prev_path = Path(prev_conflict)
+                        if prev_path.is_file():
+                            from client.archive import archive_file
+                            archive_file(prev_path.parent, prev_path.name)
                     except Exception:
                         pass
                 self.conn.execute("UPDATE conflicts SET server_file = ?, conflict_file = ?, detected_at = ? WHERE id = ?", (server_file, conflict_file, time.time(), conflict_id))
@@ -141,20 +150,39 @@ class LocalDB:
             return res
         return None
 
-    def get_pending_conflicts(self, workspace: str = None) -> List[Dict[str, Any]]:
-        if workspace:
+    def prune_missing_conflicts(self, workspace: Optional[str] = None) -> int:
+        if workspace is not None:
+            cur = self.conn.execute("SELECT id, conflict_file FROM conflicts WHERE status = 'pending' AND workspace = ?", (workspace,))
+        else:
+            cur = self.conn.execute("SELECT id, conflict_file FROM conflicts WHERE status = 'pending'")
+        
+        records = [dict(r) for r in cur.fetchall()]
+        to_dismiss = []
+        for record in records:
+            try:
+                if not Path(record['conflict_file']).exists():
+                    to_dismiss.append(record['id'])
+            except Exception:
+                pass
+        for cid in to_dismiss:
+            self.dismiss_conflict(cid)
+        return len(to_dismiss)
+
+    def get_pending_conflicts(self, workspace: Optional[str] = None) -> List[Dict[str, Any]]:
+        if workspace is not None:
             cur = self.conn.execute("SELECT * FROM conflicts WHERE status = 'pending' AND workspace = ? ORDER BY detected_at DESC", (workspace,))
         else:
             cur = self.conn.execute("SELECT * FROM conflicts WHERE status = 'pending' ORDER BY detected_at DESC")
         
         records = [dict(r) for r in cur.fetchall()]
-        active_records = []
-        for record in records:
-            if not Path(record['conflict_file']).exists():
-                self.dismiss_conflict(record['id'])
-            else:
-                active_records.append(record)
-        return active_records
+        active = []
+        for r in records:
+            try:
+                if Path(r['conflict_file']).exists():
+                    active.append(r)
+            except Exception:
+                pass
+        return active
 
     def count_pending_conflicts(self, workspace: str = None) -> int:
         return len(self.get_pending_conflicts(workspace))

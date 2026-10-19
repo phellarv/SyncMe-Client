@@ -33,6 +33,74 @@ def _safe(text: str, limit: int = 120) -> str:
     return escape(text, quote=False)
 
 
+async def _run_command(
+    cmd: list[str],
+    runner: Optional[Callable[..., Any]],
+    capture_stdout: bool = False,
+) -> tuple[int, str]:
+    proc = None
+    stdout_data = ""
+    returncode = 0
+    try:
+        if runner:
+            res = runner(cmd) if inspect.isfunction(runner) or callable(runner) else runner(*cmd)
+            if asyncio.iscoroutine(res):
+                res = await res
+            if hasattr(res, "communicate") or hasattr(res, "kill") or hasattr(res, "wait"):
+                proc = res
+            if capture_stdout and hasattr(res, "communicate"):
+                stdout_bytes, _ = await res.communicate()
+                stdout_data = stdout_bytes.decode() if isinstance(stdout_bytes, bytes) else str(stdout_bytes)
+            elif hasattr(res, "wait"):
+                returncode = await res.wait()
+            elif hasattr(res, "stdout") or hasattr(res, "returncode"):
+                stdout_data = getattr(res, "stdout", "")
+                returncode = getattr(res, "returncode", 0)
+            elif isinstance(res, (tuple, list)):
+                if len(res) >= 1:
+                    returncode = res[0]
+                if len(res) >= 2:
+                    stdout_data = res[1]
+            elif isinstance(res, str):
+                stdout_data = res
+        else:
+            if capture_stdout:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, _ = await proc.communicate()
+                stdout_data = stdout_bytes.decode()
+                returncode = proc.returncode or 0
+            else:
+                proc = await asyncio.create_subprocess_exec(*cmd)
+                returncode = await proc.wait()
+    except asyncio.CancelledError:
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        raise
+    return returncode, str(stdout_data)
+
+
+async def _invoke_on_resolve(
+    on_resolve: Optional[Callable[[str, str], Any]],
+    rel_path: str,
+    action: str,
+) -> None:
+    if not on_resolve:
+        return
+    if inspect.iscoroutinefunction(on_resolve):
+        await on_resolve(rel_path, action)
+    else:
+        cb_res = on_resolve(rel_path, action)
+        if asyncio.iscoroutine(cb_res):
+            await cb_res
+
+
 async def handle_conflict_notification(
     workspace: str,
     rel_path: str,
@@ -58,102 +126,25 @@ async def handle_conflict_notification(
     ]
 
     try:
-        proc = None
-        stdout_data = ""
-        try:
-            if runner:
-                res = runner(cmd) if inspect.isfunction(runner) or callable(runner) else runner(*cmd)
-                if asyncio.iscoroutine(res):
-                    res = await res
-                if hasattr(res, "communicate"):
-                    proc = res
-                    stdout_bytes, _ = await res.communicate()
-                    stdout_data = stdout_bytes.decode() if isinstance(stdout_bytes, bytes) else str(stdout_bytes)
-                elif hasattr(res, "stdout"):
-                    stdout_data = res.stdout
-                elif isinstance(res, (tuple, list)) and len(res) >= 2:
-                    stdout_data = res[1]
-                elif isinstance(res, str):
-                    stdout_data = res
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout_bytes, _ = await proc.communicate()
-                stdout_data = stdout_bytes.decode()
-        except asyncio.CancelledError:
-            if proc:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            raise
-
-        action = str(stdout_data).strip()
+        _, stdout_data = await _run_command(cmd, runner, capture_stdout=True)
+        action = stdout_data.strip()
 
         if action == "meld":
             meld_cmd = ["meld", str(server_file), str(conflict_file)]
-            returncode = 0
-            proc_meld = None
-            try:
-                if runner:
-                    res = runner(meld_cmd)
-                    if asyncio.iscoroutine(res):
-                        res = await res
-                    if hasattr(res, "communicate") or hasattr(res, "kill") or hasattr(res, "wait"):
-                        proc_meld = res
-                    if hasattr(res, "wait"):
-                        returncode = await res.wait()
-                    elif hasattr(res, "returncode"):
-                        returncode = res.returncode
-                    elif isinstance(res, (tuple, list)) and len(res) >= 1:
-                        returncode = res[0]
-                else:
-                    proc_meld = await asyncio.create_subprocess_exec(*meld_cmd)
-                    returncode = await proc_meld.wait()
-            except asyncio.CancelledError:
-                if proc_meld:
-                    try:
-                        proc_meld.kill()
-                    except Exception:
-                        pass
-                raise
-
+            returncode, _ = await _run_command(meld_cmd, runner, capture_stdout=False)
             if returncode == 0:
-                if conflict_file.exists():
-                    await asyncio.to_thread(conflict_file.unlink)
-                if on_resolve:
-                    if inspect.iscoroutinefunction(on_resolve):
-                        await on_resolve(rel_path, "meld")
-                    else:
-                        cb_res = on_resolve(rel_path, "meld")
-                        if asyncio.iscoroutine(cb_res):
-                            await cb_res
+                await _invoke_on_resolve(on_resolve, rel_path, "meld")
+                await asyncio.to_thread(conflict_file.unlink, missing_ok=True)
 
         elif action == "local":
+            await _invoke_on_resolve(on_resolve, rel_path, "local")
             if conflict_file.exists():
                 await asyncio.to_thread(shutil.copy2, conflict_file, server_file)
-                await asyncio.to_thread(conflict_file.unlink)
-            if on_resolve:
-                if inspect.iscoroutinefunction(on_resolve):
-                    await on_resolve(rel_path, "local")
-                else:
-                    cb_res = on_resolve(rel_path, "local")
-                    if asyncio.iscoroutine(cb_res):
-                        await cb_res
+            await asyncio.to_thread(conflict_file.unlink, missing_ok=True)
 
         elif action == "server":
-            if conflict_file.exists():
-                await asyncio.to_thread(conflict_file.unlink)
-            if on_resolve:
-                if inspect.iscoroutinefunction(on_resolve):
-                    await on_resolve(rel_path, "server")
-                else:
-                    cb_res = on_resolve(rel_path, "server")
-                    if asyncio.iscoroutine(cb_res):
-                        await cb_res
+            await _invoke_on_resolve(on_resolve, rel_path, "server")
+            await asyncio.to_thread(conflict_file.unlink, missing_ok=True)
 
     except asyncio.CancelledError:
         raise

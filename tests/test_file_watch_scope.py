@@ -103,3 +103,39 @@ async def test_file_entries_in_one_directory_share_one_watcher(tmp_path, monkeyp
     await asyncio.wait_for(engine._watch_loop(), 5)
 
     assert sorted(w.sync_dir for w in RecordingWatcher.created) == [tmp_path, tmp_path / "other"]
+
+
+@pytest.mark.asyncio
+async def test_watch_loop_creates_missing_parent_directory(tmp_path):
+    missing_dir = tmp_path / "nonexistent_parent"
+    assert not missing_dir.exists()
+    engine = make_engine(tmp_path, ["nonexistent_parent/config.fish"])
+
+    task = asyncio.create_task(engine._watch_loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert missing_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_watch_loop_survives_uncreatable_parent_directory(tmp_path):
+    file_as_dir = tmp_path / "blocked_file"
+    file_as_dir.write_text("i am a file")
+    valid_dir = tmp_path / "valid_parent"
+    valid_dir.mkdir()
+
+    engine = make_engine(tmp_path, ["blocked_file/child.txt", "valid_parent/good.txt"])
+
+    task = asyncio.create_task(engine._watch_loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+

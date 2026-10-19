@@ -19,6 +19,11 @@ def archive_file(sync_dir: Path, rel_path: str):
     archive_name = f"{safe_name}_{timestamp}"
     archive_dir = get_archive_dir(sync_dir)
     archive_path = archive_dir / archive_name
+    n = 0
+    while archive_path.exists():
+        n += 1
+        archive_name = f"{safe_name}_{timestamp}-{n}"
+        archive_path = archive_dir / archive_name
 
     shutil.copy2(full_path, archive_path)
     return archive_name
@@ -39,13 +44,15 @@ def list_archive(sync_dir: Path) -> List[Dict[str, str]]:
     return results
 
 def restore_file(sync_dir: Path, archive_name: str, target_rel_path: str):
+    from client.pathsafe import safe_join
     archive_dir = get_archive_dir(sync_dir)
-    archive_path = archive_dir / archive_name
+    archive_path = safe_join(archive_dir, archive_name)
     
     if not archive_path.exists():
         raise FileNotFoundError(f"Archive {archive_name} not found")
         
-    target_path = sync_dir / target_rel_path
+    clean_target = target_rel_path.lstrip("/\\")
+    target_path = safe_join(sync_dir, clean_target)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     
     shutil.copy2(archive_path, target_path)

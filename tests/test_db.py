@@ -26,3 +26,17 @@ def test_db_operations(tmp_path: Path):
     assert db.get_file("test.txt") is None
     
     db.close()
+
+
+def test_localdb_context_manager(tmp_path: Path):
+    db_path = tmp_path / "test_cm.db"
+    with LocalDB(db_path) as db:
+        assert not db.is_initialized()
+        db.set_initialized(True)
+        assert db.is_initialized()
+        assert db.get_last_server_revision() == 0
+    # After exiting, connection should be closed
+    import sqlite3
+    import pytest
+    with pytest.raises(sqlite3.ProgrammingError):
+        db.conn.execute("SELECT 1")
