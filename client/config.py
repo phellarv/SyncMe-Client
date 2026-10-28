@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import tomllib
 import unicodedata
 from pathlib import Path
@@ -202,6 +203,17 @@ class ClientConfig(BaseModel):
     @property
     def REQUEST_TIMEOUT(self) -> float: return self.server.request_timeout
 
+    def get_sync_targets(self) -> dict[str, list]:
+        """Return a mapping of all configured sync targets: directories and files."""
+        return {
+            "directories": list(self.directories),
+            "files": list(self.files),
+        }
+
+    def get_sync_targets_toml(self, portable: bool = True) -> str:
+        """Return a TOML string representation of the configured sync targets."""
+        return targets_to_toml(self.get_sync_targets(), portable=portable)
+
 def get_config_path() -> Path:
     env_path = os.getenv("SYNCME_CONFIG_PATH")
     if env_path:
@@ -272,5 +284,53 @@ def load_config(path: Optional[Path] = None) -> ClientConfig:
         config.server.request_timeout = float(os.environ["SYNCME_REQUEST_TIMEOUT"])
 
     return config
+
+def get_sync_targets(config: Optional[ClientConfig] = None) -> dict[str, list]:
+    """Retrieve synced directories and files for the given config or loaded config."""
+    cfg = config if config is not None else load_config()
+    return cfg.get_sync_targets()
+
+def _toml_str(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+def _format_portable_path(path: Path) -> str:
+    try:
+        rel = path.relative_to(Path.home())
+        return f"~/{rel}" if str(rel) != "." else "~"
+    except (ValueError, RuntimeError):
+        return str(path)
+
+def targets_to_toml(targets: dict[str, list], portable: bool = True) -> str:
+    lines = []
+    for d in targets.get("directories", []):
+        lines.append("[[directories]]")
+        lines.append(f"name = {_toml_str(d.name)}")
+        p_str = _format_portable_path(d.local_path) if portable else str(d.local_path)
+        lines.append(f"local_path = {_toml_str(p_str)}")
+        lines.append(f"conflict_strategy = {_toml_str(d.conflict_strategy)}")
+        lines.append(f"replace_symlinks = {str(d.replace_symlinks).lower()}")
+        if d.exceptions:
+            ex_list = ", ".join(_toml_str(e) for e in d.exceptions)
+            lines.append(f"exceptions = [{ex_list}]")
+        lines.append("")
+
+    for f in targets.get("files", []):
+        lines.append("[[files]]")
+        lines.append(f"workspace = {_toml_str(f.workspace)}")
+        p_str = _format_portable_path(f.local_path) if portable else str(f.local_path)
+        lines.append(f"local_path = {_toml_str(p_str)}")
+        if f.remote_path and f.remote_path != Path(f.local_path).name:
+            lines.append(f"remote_path = {_toml_str(f.remote_path)}")
+        lines.append(f"conflict_strategy = {_toml_str(f.conflict_strategy)}")
+        lines.append(f"replace_symlinks = {str(f.replace_symlinks).lower()}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def get_sync_targets_toml(config: Optional[ClientConfig] = None, portable: bool = True) -> str:
+    """Retrieve synced targets as a TOML string suitable for pasting into config.toml."""
+    cfg = config if config is not None else load_config()
+    return cfg.get_sync_targets_toml(portable=portable)
 
 settings = load_config()

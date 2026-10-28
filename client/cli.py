@@ -1,10 +1,11 @@
 from client.conflicts import format_inline_diff
+import json
 import click
 import asyncio
 from pathlib import Path
 import sys
 
-from client.config import settings, save_default_config, load_config, ConfigError, check_server_config, warn_if_config_loose
+from client.config import settings, save_default_config, load_config, ConfigError, check_server_config, warn_if_config_loose, get_sync_targets, get_sync_targets_toml
 from client.db import LocalDB
 from client.api import APIClient
 from client.engine import SyncEngine
@@ -94,6 +95,9 @@ def init(directory, conflict_strategy):
         click.echo(f"Directory '{directory}' not found in config.")
         return
 
+    # Set by S/L at the prompt; applies to every remaining conflict in this run, across directories.
+    apply_to_all = None
+
     async def _init_engine(d_conf, engine):
         if engine.db.is_initialized():
             if not click.confirm(f"[{d_conf.name}] SyncMe is already initialized. Re-run initial sync?"):
@@ -102,6 +106,10 @@ def init(directory, conflict_strategy):
         strategy = conflict_strategy or d_conf.conflict_strategy or "ask"
 
         def conflict_callback(rel_path, server_file, local_file):
+            nonlocal apply_to_all
+            if apply_to_all:
+                click.echo(f"[{d_conf.name}] Conflict: {rel_path} -> {'server' if apply_to_all == 's' else 'local'} wins (applied to all)")
+                return apply_to_all
             click.echo(f"[{d_conf.name}] Conflict detected for: {rel_path}")
             click.echo(f"  Local:  size={local_file.get('size')}, mtime={local_file.get('mtime')}")
             click.echo(f"  Server: size={server_file.get('size')}, mtime={server_file.get('mtime')}")
@@ -109,7 +117,11 @@ def init(directory, conflict_strategy):
             if strategy != 'ask':
                 default_choice = strategy[0]
             
-            choice = click.prompt("Choose action: [s]erver wins, [l]ocal wins, [b]oth (keep local as .conflict)", type=click.Choice(['s', 'l', 'b']), default=default_choice)
+            choice = click.prompt("Choose action: [s]erver wins, [l]ocal wins, [b]oth (keep local as .conflict), "
+                                  "[S]erver wins for all remaining, [L]ocal wins for all remaining",
+                                  type=click.Choice(['s', 'l', 'b', 'S', 'L']), default=default_choice)
+            if choice in ('S', 'L'):
+                choice = apply_to_all = choice.lower()
             return choice
 
         try:
@@ -177,6 +189,65 @@ def status(directory):
     for d_conf, engine in engines:
         files = engine.db.get_all_files()
         click.echo(f"[{d_conf.name}] Tracking {len(files)} files.")
+
+def _path_status(path: Path) -> str:
+    try:
+        return "exists" if path.exists() else "does not exist"
+    except OSError:
+        return "inaccessible"
+
+@cli.command(name="targets")
+@click.option("--json", "as_json", is_flag=True, help="Output targets as JSON")
+@click.option("--toml", "as_toml", is_flag=True, help="Output targets as TOML (suitable for config.toml)")
+def targets(as_json: bool, as_toml: bool):
+    """List all configured sync targets (directories and single files)."""
+    if as_json and as_toml:
+        raise click.UsageError("Cannot specify both --json and --toml")
+
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        click.secho(f"Error: {e}", fg="red", bold=True)
+        sys.exit(1)
+
+    if as_toml:
+        click.echo(get_sync_targets_toml(cfg), nl=False)
+        return
+
+    sync_targets = get_sync_targets(cfg)
+
+    if as_json:
+        payload = {
+            "directories": [d.model_dump(mode="json") for d in sync_targets["directories"]],
+            "files": [f.model_dump(mode="json") for f in sync_targets["files"]],
+        }
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    click.echo("Directories:")
+    if not sync_targets["directories"]:
+        click.echo("  (none)")
+    else:
+        for d in sync_targets["directories"]:
+            state = _path_status(d.local_path)
+            click.echo(f"  - Name: {d.name}")
+            click.echo(f"    Path: {d.local_path} ({state})")
+            click.echo(f"    Conflict strategy: {d.conflict_strategy}")
+            click.echo(f"    Replace symlinks: {d.replace_symlinks}")
+            exceptions_str = ", ".join(d.exceptions) if d.exceptions else "none"
+            click.echo(f"    Exceptions: {exceptions_str}")
+
+    click.echo("\nFiles:")
+    if not sync_targets["files"]:
+        click.echo("  (none)")
+    else:
+        for f in sync_targets["files"]:
+            state = _path_status(f.local_path)
+            click.echo(f"  - Workspace: {f.workspace}")
+            click.echo(f"    Path: {f.local_path} ({state})")
+            click.echo(f"    Remote path: {f.remote_path}")
+            click.echo(f"    Conflict strategy: {f.conflict_strategy}")
+            click.echo(f"    Replace symlinks: {f.replace_symlinks}")
 
 @cli.group()
 def archive():

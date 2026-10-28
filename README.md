@@ -84,7 +84,7 @@ When setting up a new sync directory or reconnecting an existing folder, `syncme
 
 #### Initial Synchronization Discrepancies
 During `syncme-client init`, file discrepancies between local files and the server are resolved according to `--conflict-strategy` (or per-workspace configuration in `config.toml`):
-- `ask` (default): Displays local and remote file size/mtime and prompts for choice interactively.
+- `ask` (default): Displays local and remote file size/mtime and prompts for choice interactively. Answering `S` or `L` (uppercase) applies server-wins or local-wins to this and every remaining conflict in the same `init` run, across all directories, without asking again.
 - `server` (`s`): Server version wins. Local file is moved to `.syncme/archive/` and remote file is downloaded.
 - `local` (`l`): Local version wins. Local file is uploaded to the server, overwriting server state with `If-Match: <server_revision>`.
 - `both` (`b`): Keeps both. The remote file is downloaded and verified first; then the local file is renamed to `<stem>.conflict.<timestamp><suffix>` and the remote file takes its place. If the download fails, nothing local changes and the file is counted as failed.
